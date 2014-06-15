@@ -31,16 +31,14 @@ module Motion; module Project;
     include Rake::DSL if Object.const_defined?(:Rake) && Rake.const_defined?(:DSL)
 
     def build(config, platform, opts)
-      datadir = config.datadir
-      unless File.exist?(File.join(datadir, platform))
+      unless File.exist?(File.join(config.datadir, platform))
         $stderr.puts "This version of RubyMotion does not support `#{platform}'"
         exit 1
       end
-      archs = config.archs[platform]
 
       static_library = opts.delete(:static)
 
-      ruby = File.join(config.bindir, 'ruby')
+      @ruby = File.join(config.bindir, 'ruby')
       @nfd = File.join(config.bindir, 'nfd')
 
       if config.spec_mode and (config.spec_files - config.spec_core_files).empty?
@@ -51,9 +49,9 @@ module Motion; module Project;
       config.resources_dirs.uniq!
 
       # Locate SDK and compilers.
-      sdk = config.sdk(platform)
-      cc = config.locate_compiler(platform, 'clang')
-      cxx = config.locate_compiler(platform, 'clang++')
+      @sdk = config.sdk(platform)
+      @cc = config.locate_compiler(platform, 'clang')
+      @cxx = config.locate_compiler(platform, 'clang++')
 
       build_dir = File.join(config.versionized_build_dir(platform))
       App.info 'Build', build_dir
@@ -89,74 +87,9 @@ module Motion; module Project;
       # Build object files.
       objs_build_dir = File.join(build_dir, 'objs')
       FileUtils.mkdir_p(objs_build_dir)
-      any_obj_file_built = false
-      project_files = Dir.glob("**/*.rb").map{ |x| File.expand_path(x) }
-      is_default_archs = (archs == config.default_archs[platform])
-      rubyc_bs_flags = bs_files.map { |x| "--uses-bs \"" + x + "\" " }.join(' ')
+      @any_obj_file_built = false
 
-      build_file = Proc.new do |files_build_dir, path|
-        rpath = path
-        path = File.expand_path(path)
-        if is_default_archs && !project_files.include?(path)
-          files_build_dir = File.expand_path(File.join(Builder.common_build_dir, files_build_dir))
-        end
-        obj = File.join(files_build_dir, "#{path}.o")
-        should_rebuild = (!File.exist?(obj) \
-            or File.mtime(path) > File.mtime(obj) \
-            or File.mtime(ruby) > File.mtime(obj))
-
-        # Generate or retrieve init function.
-        init_func = should_rebuild ? "MREP_#{`/usr/bin/uuidgen`.strip.gsub('-', '')}" : `#{config.locate_binary('nm')} \"#{obj}\"`.scan(/T\s+_(MREP_.*)/)[0][0]
-
-        if should_rebuild
-          App.info 'Compile', rpath
-          FileUtils.mkdir_p(File.dirname(obj))
-          arch_objs = []
-          archs.each do |arch|
-            # Locate arch kernel.
-            kernel = File.join(datadir, platform, "kernel-#{arch}.bc")
-            raise "Can't locate kernel file" unless File.exist?(kernel)
-
-            # Assembly.
-            asm = File.join(files_build_dir, "#{path}.#{arch}.s")
-            arm64 = false
-            compiler_exec_arch = case arch
-              when /^arm/
-                (arm64 = (arch == 'arm64')) ? 'x86_64' : 'i386'
-              else
-                arch
-            end
-            sh "/usr/bin/env VM_PLATFORM=\"#{platform}\" VM_KERNEL_PATH=\"#{kernel}\" VM_OPT_LEVEL=\"#{config.opt_level}\" /usr/bin/arch -arch #{compiler_exec_arch} #{ruby} #{rubyc_bs_flags} --emit-llvm \"#{asm}\" #{init_func} \"#{path}\""
-
-            # Object
-            arch_obj = File.join(files_build_dir, "#{path}.#{arch}.o")
-            if arm64
-              # At the time of this writing Apple hasn't yet contributed the source code of the LLVM backend for the "arm64" architecture, so the RubyMotion compiler can't emit proper assembly yet. We work around this limitation by generating bitcode instead and giving it to the linker. Ugly but should be temporary (right?).
-              @dummy_object_file ||= begin
-                src_path = '/tmp/__dummy_object_file__.c'
-                obj_path = '/tmp/__dummy_object_file__.o'
-                File.open(src_path, 'w') { |io| io.puts "static int foo(void) { return 42; }" }
-                sh "#{cc} -c #{src_path} -o #{obj_path} -arch arm64 -miphoneos-version-min=7.0"
-                obj_path
-              end
-              ld_path = File.join(App.config.xcode_dir, 'Toolchains/XcodeDefault.xctoolchain/usr/bin/ld')
-              sh "#{ld_path} \"#{asm}\" \"#{@dummy_object_file}\" -arch arm64 -r -o \"#{arch_obj}\""
-            else
-              sh "#{cc} -fexceptions -c -arch #{arch} \"#{asm}\" -o \"#{arch_obj}\""
-            end
-
-            [asm].each { |x| File.unlink(x) } unless ENV['keep_temps']
-            arch_objs << arch_obj
-          end
-
-          # Assemble fat binary.
-          arch_objs_list = arch_objs.map { |x| "\"#{x}\"" }.join(' ')
-          sh "/usr/bin/lipo -create #{arch_objs_list} -output \"#{obj}\""
-        end
-
-        any_obj_file_built = true
-        [obj, init_func]
-      end
+      build_file = build_file(bs_files, config, platform)
 
       # Resolve file dependencies.
       if config.detect_dependencies == true
@@ -176,69 +109,9 @@ module Motion; module Project;
       end
 
       # Generate init file.
-      init_txt = <<EOS
-extern "C" {
-    void ruby_sysinit(int *, char ***);
-    void ruby_init(void);
-    void ruby_init_loadpath(void);
-    void ruby_script(const char *);
-    void ruby_set_argv(int, char **);
-    void rb_vm_init_compiler(void);
-    void rb_vm_init_jit(void);
-    void rb_vm_aot_feature_provide(const char *, void *);
-    void *rb_vm_top_self(void);
-    void rb_define_global_const(const char *, void *);
-    void rb_rb2oc_exc_handler(void);
-    void rb_exit(int);
-EOS
-      app_objs.each do |_, init_func|
-        init_txt << "void #{init_func}(void *, void *);\n"
-      end
-      init_txt << <<EOS
-}
+      init_o = build_init_file(app_objs, objs_build_dir, config, platform)
 
-extern "C"
-void
-RubyMotionInit(int argc, char **argv)
-{
-    static bool initialized = false;
-    if (!initialized) {
-	ruby_init();
-	ruby_init_loadpath();
-        if (argc > 0) {
-	    const char *progname = argv[0];
-	    ruby_script(progname);
-	}
-#if !__LP64__
-	try {
-#endif
-	    void *self = rb_vm_top_self();
-EOS
-      init_txt << config.define_global_env_txt
-      app_objs.each do |_, init_func|
-        init_txt << "#{init_func}(self, 0);\n"
-      end
-      init_txt << <<EOS
-#if !__LP64__
-	}
-	catch (...) {
-	    rb_rb2oc_exc_handler();
-	}
-#endif
-	initialized = true;
-    }
-}
-EOS
-
-      # Compile init file.
-      init = File.join(objs_build_dir, 'init.mm')
-      init_o = File.join(objs_build_dir, 'init.o')
-      if !(File.exist?(init) and File.exist?(init_o) and File.read(init) == init_txt)
-        File.open(init, 'w') { |io| io.write(init_txt) }
-        sh "#{cxx} \"#{init}\" #{config.cflags(platform, true)} -c -o \"#{init_o}\""
-      end
-
-      librubymotion = File.join(datadir, platform, 'librubymotion-static.a')
+      librubymotion = File.join(config.datadir, platform, 'librubymotion-static.a')
       if static_library
         # Create a static archive with all object files + the runtime.
         lib = File.join(config.versionized_build_dir(platform), config.name + '.a')
@@ -248,26 +121,14 @@ EOS
         return lib
       end
 
-      # Generate main file.
-      main_txt = config.main_cpp_file_txt(spec_objs)
+      FileUtils.touch(objs_build_dir) if @any_obj_file_built
 
-      # Compile main file.
-      main = File.join(objs_build_dir, 'main.mm')
-      main_o = File.join(objs_build_dir, 'main.o')
-      if !(File.exist?(main) and File.exist?(main_o) and File.read(main) == main_txt)
-        File.open(main, 'w') { |io| io.write(main_txt) }
-        sh "#{cxx} \"#{main}\" #{config.cflags(platform, true)} -c -o \"#{main_o}\""
-      end
+      # Generate main file.
+      main_o = build_main_file(spec_objs, objs_build_dir, config, platform)
 
       # Generate main file for extensions
-      extension_main_txt = config.extension_main_cpp_file_txt(spec_objs)
-
-      # Compile extension main file.
-      extension_main = File.join(objs_build_dir, 'extension_main.mm')
-      extension_main_o = File.join(objs_build_dir, 'extension_main.o')
-      if !(File.exist?(extension_main) and File.exist?(extension_main_o) and File.read(extension_main) == extension_main_txt)
-        File.open(extension_main, 'w') { |io| io.write(extension_main_txt) }
-        sh "#{cxx} \"#{extension_main}\" #{config.cflags(platform, true)} -c -o \"#{extension_main_o}\""
+      if config.extensions.any?
+        main_extension_o = build_extension_main_file(spec_objs, objs_build_dir, config, platform)
       end
 
       # Prepare bundle.
@@ -279,53 +140,14 @@ EOS
 
       # Link executable.
       main_exec = config.app_bundle_executable(platform)
-      unless File.exist?(File.dirname(main_exec))
-        App.info 'Create', File.dirname(main_exec)
-        FileUtils.mkdir_p(File.dirname(main_exec))
-      end
-      main_exec_created = false
-      if !File.exist?(main_exec) \
-          or File.mtime(config.project_file) > File.mtime(main_exec) \
-          or objs.any? { |path, _| File.mtime(path) > File.mtime(main_exec) } \
-	  or File.mtime(main_o) > File.mtime(main_exec) \
-          or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(main_exec) } \
-          or File.mtime(librubymotion) > File.mtime(main_exec)
-        App.info 'Link', main_exec
-        objs_list = objs.map { |path, _| path }.unshift(init_o, main_o, *config.frameworks_stubs_objects(platform)).map { |x| "\"#{x}\"" }.join(' ')
-        framework_search_paths = (config.framework_search_paths + (embedded_frameworks + external_frameworks).map { |x| File.dirname(x) }).uniq.map { |x| "-F '#{File.expand_path(x)}'" }.join(' ')
-        frameworks = (config.frameworks_dependencies + (embedded_frameworks + external_frameworks).map { |x| File.basename(x, '.framework') }).map { |x| "-framework #{x}" }.join(' ')
-        weak_frameworks = config.weak_frameworks.map { |x| "-weak_framework #{x}" }.join(' ')
-        vendor_libs = config.vendor_projects.inject([]) do |libs, vendor_project|
-          libs << vendor_project.libs.map { |x|
-            (vendor_project.opts[:force_load] ? '-force_load ' : '-ObjC ') + "\"#{x}\""
-          }
-        end.join(' ')
-        linker_option = begin
-          m = config.deployment_target.match(/(\d+)/)
-          if m[0].to_i < 7
-            "-stdlib=libstdc++"
-          end
-        end || ""
-        sh "#{cxx} -o \"#{main_exec}\" #{objs_list} #{config.ldflags(platform)} -L#{File.join(datadir, platform)} -lrubymotion-static -lobjc -licucore #{linker_option} #{framework_search_paths} #{frameworks} #{weak_frameworks} #{config.libs.join(' ')} #{vendor_libs}"
-        main_exec_created = true
+      should_link_executable = !File.exist?(main_exec) \
+        or File.mtime(config.project_file) > File.mtime(main_exec) \
+        or objs.any? { |path, _| File.mtime(path) > File.mtime(main_exec) } \
+        or File.mtime(main_o) > File.mtime(main_exec) \
+        or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(main_exec) } \
+        or File.mtime(librubymotion) > File.mtime(main_exec)
 
-        # Change the install name of embedded frameworks.
-        embedded_frameworks.each do |path|
-          res = `/usr/bin/otool -L \"#{main_exec}\"`.scan(/(.*#{File.basename(path)}.*)\s\(/)
-          if res and res[0] and res[0][0]
-            old_path = res[0][0].strip
-            if platform == "MacOSX"
-              exec_path = "@executable_path/../Frameworks/"
-            else
-              exec_path = "@executable_path/Frameworks/"
-            end
-            new_path = exec_path + old_path.scan(/#{File.basename(path)}.*/)[0]
-            sh "/usr/bin/install_name_tool -change \"#{old_path}\" \"#{new_path}\" \"#{main_exec}\""
-          else
-            App.warn "Cannot locate and fix install name path of embedded framework `#{path}' in executable `#{main_exec}', application might not start"
-          end
-        end
-      end
+      link_executable(main_exec, should_link_executable, config, platform)
 
       # Build extensions
       config.extensions.each do |extension|
@@ -344,74 +166,9 @@ EOS
         # Build object files.
         objs_build_dir = File.join(build_dir, 'objs')
         FileUtils.mkdir_p(objs_build_dir)
-        any_obj_file_built = false
-        project_files = Dir.glob("**/*.rb").map{ |x| File.expand_path(x) }
-        is_default_archs = (archs == config.default_archs[platform])
-        rubyc_bs_flags = bs_files.map { |x| "--uses-bs \"" + x + "\" " }.join(' ')
+        @any_obj_file_built = false
 
-        build_file = Proc.new do |files_build_dir, path|
-          rpath = path
-          path = File.expand_path(path)
-          if is_default_archs && !project_files.include?(path)
-            files_build_dir = File.expand_path(File.join(Builder.common_build_dir, files_build_dir))
-          end
-          obj = File.join(files_build_dir, "#{path}.o")
-          should_rebuild = (!File.exist?(obj) \
-              or File.mtime(path) > File.mtime(obj) \
-              or File.mtime(ruby) > File.mtime(obj))
-
-          # Generate or retrieve init function.
-          init_func = should_rebuild ? "MREP_#{`/usr/bin/uuidgen`.strip.gsub('-', '')}" : `#{config.locate_binary('nm')} \"#{obj}\"`.scan(/T\s+_(MREP_.*)/)[0][0]
-
-          if should_rebuild
-            App.info 'Compile', rpath
-            FileUtils.mkdir_p(File.dirname(obj))
-            arch_objs = []
-            archs.each do |arch|
-              # Locate arch kernel.
-              kernel = File.join(datadir, platform, "kernel-#{arch}.bc")
-              raise "Can't locate kernel file" unless File.exist?(kernel)
-
-              # Assembly.
-              asm = File.join(files_build_dir, "#{path}.#{arch}.s")
-              arm64 = false
-              compiler_exec_arch = case arch
-                when /^arm/
-                  (arm64 = (arch == 'arm64')) ? 'x86_64' : 'i386'
-                else
-                  arch
-              end
-              sh "/usr/bin/env VM_PLATFORM=\"#{platform}\" VM_KERNEL_PATH=\"#{kernel}\" VM_OPT_LEVEL=\"#{config.opt_level}\" /usr/bin/arch -arch #{compiler_exec_arch} #{ruby} #{rubyc_bs_flags} --emit-llvm \"#{asm}\" #{init_func} \"#{path}\""
-
-              # Object
-              arch_obj = File.join(files_build_dir, "#{path}.#{arch}.o")
-              if arm64
-                # At the time of this writing Apple hasn't yet contributed the source code of the LLVM backend for the "arm64" architecture, so the RubyMotion compiler can't emit proper assembly yet. We work around this limitation by generating bitcode instead and giving it to the linker. Ugly but should be temporary (right?).
-                @dummy_object_file ||= begin
-                  src_path = '/tmp/__dummy_object_file__.c'
-                  obj_path = '/tmp/__dummy_object_file__.o'
-                  File.open(src_path, 'w') { |io| io.puts "static int foo(void) { return 42; }" }
-                  sh "#{cc} -c #{src_path} -o #{obj_path} -arch arm64 -miphoneos-version-min=7.0"
-                  obj_path
-                end
-                ld_path = File.join(App.config.xcode_dir, 'Toolchains/XcodeDefault.xctoolchain/usr/bin/ld')
-                sh "#{ld_path} \"#{asm}\" \"#{@dummy_object_file}\" -arch arm64 -r -o \"#{arch_obj}\""
-              else
-                sh "#{cc} -fexceptions -c -arch #{arch} \"#{asm}\" -o \"#{arch_obj}\""
-              end
-
-              [asm].each { |x| File.unlink(x) } unless ENV['keep_temps']
-              arch_objs << arch_obj
-            end
-
-            # Assemble fat binary.
-            arch_objs_list = arch_objs.map { |x| "\"#{x}\"" }.join(' ')
-            sh "/usr/bin/lipo -create #{arch_objs_list} -output \"#{obj}\""
-          end
-
-          any_obj_file_built = true
-          [obj, init_func]
-        end
+        build_file = build_file(bs_files, extension, platform)
 
         # Resolve file dependencies.
         if extension.detect_dependencies == true
@@ -424,124 +181,23 @@ EOS
         extension_parallel.run
         extension_objs = extension_parallel.objects
 
-        # TODO add support for vendor libs
-        vendor_libs = []
-
-
         # Generate init file.
-        extension_init_txt = <<EOS
-extern "C" {
-    void ruby_sysinit(int *, char ***);
-    void ruby_init(void);
-    void ruby_init_loadpath(void);
-    void ruby_script(const char *);
-    void ruby_set_argv(int, char **);
-    void rb_vm_init_compiler(void);
-    void rb_vm_init_jit(void);
-    void rb_vm_aot_feature_provide(const char *, void *);
-    void *rb_vm_top_self(void);
-    void rb_define_global_const(const char *, void *);
-    void rb_rb2oc_exc_handler(void);
-    void rb_exit(int);
-EOS
-      extension_objs.each do |_, init_func|
-        extension_init_txt << "void #{init_func}(void *, void *);\n"
-      end
-      extension_init_txt << <<EOS
-}
+        init_o = build_init_file(extension_objs, objs_build_dir, config, platform, "#{extension.name}_init")
 
-extern "C"
-void
-RubyMotionInit(int argc, char **argv)
-{
-    static bool initialized = false;
-    if (!initialized) {
-  ruby_init();
-  ruby_init_loadpath();
-        if (argc > 0) {
-      const char *progname = argv[0];
-      ruby_script(progname);
-  }
-#if !__LP64__
-  try {
-#endif
-      void *self = rb_vm_top_self();
-EOS
-      extension_init_txt << config.define_global_env_txt
-      extension_objs.each do |_, init_func|
-        extension_init_txt << "#{init_func}(self, 0);\n"
-      end
-      extension_init_txt << <<EOS
-#if !__LP64__
-  }
-  catch (...) {
-      rb_rb2oc_exc_handler();
-  }
-#endif
-  initialized = true;
-    }
-}
-EOS
-
-        # Compile init file.
-        extension_init = File.join(objs_build_dir, "#{extension.name}_init.mm")
-        extension_init_o = File.join(objs_build_dir, "#{extension.name}_init.o")
-        if !(File.exist?(extension_init) and File.exist?(extension_init_o) and File.read(extension_init) == extension_init_txt)
-          File.open(extension_init, 'w') { |io| io.write(extension_init_txt) }
-          sh "#{cxx} \"#{extension_init}\" #{config.cflags(platform, true)} -c -o \"#{extension_init_o}\""
-        end
-
-        FileUtils.touch(objs_build_dir) if any_obj_file_built
+        FileUtils.touch(objs_build_dir) if @any_obj_file_built
 
         extension_path = File.join(config.app_extensions_dir(platform), [config.identifier, extension.name, 'appex'].join('.'))
+
+        # Link executable
         main_exec = File.join(extension_path, [config.identifier, extension.name].join('.'))
+        should_link_executable = !File.exist?(main_exec) \
+          or File.mtime(extension.project_file) > File.mtime(main_exec) \
+          or extension_objs.any? { |path, _| File.mtime(path) > File.mtime(main_exec) } \
+          or File.mtime(main_extension_o) > File.mtime(main_exec) \
+          or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(main_exec) } \
+          or File.mtime(librubymotion) > File.mtime(main_exec)
 
-        unless File.exist?(File.dirname(main_exec))
-          App.info 'Create', File.dirname(main_exec)
-          FileUtils.mkdir_p(File.dirname(main_exec))
-        end
-        main_exec_created = false
-        if !File.exist?(main_exec) \
-            or File.mtime(extension.project_file) > File.mtime(main_exec) \
-            or extension_objs.any? { |path, _| File.mtime(path) > File.mtime(main_exec) } \
-            or File.mtime(main_o) > File.mtime(main_exec) \
-            or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(main_exec) } \
-            or File.mtime(librubymotion) > File.mtime(main_exec)
-          App.info 'Link', main_exec
-          objs_list = extension_objs.map { |path, _| path }.unshift(extension_init_o, extension_main_o, *extension.frameworks_stubs_objects(platform)).map { |x| "\"#{x}\"" }.join(' ')
-          framework_search_paths = (extension.framework_search_paths + (embedded_frameworks + external_frameworks).map { |x| File.dirname(x) }).uniq.map { |x| "-F '#{File.expand_path(x)}'" }.join(' ')
-          frameworks = (extension.frameworks_dependencies + (embedded_frameworks + external_frameworks).map { |x| File.basename(x, '.framework') }).map { |x| "-framework #{x}" }.join(' ')
-          # p extension.frameworks
-          # p extension.frameworks_dependencies
-          # p config.frameworks
-          # p config.frameworks_dependencies
-          weak_frameworks = extension.weak_frameworks.map { |x| "-weak_framework #{x}" }.join(' ')
-          vendor_libs = extension.vendor_projects.inject([]) do |libs, vendor_project|
-            libs << vendor_project.libs.map { |x|
-              (vendor_project.opts[:force_load] ? '-force_load ' : '-ObjC ') + "\"#{x}\""
-            }
-          end.join(' ')
-          linker_option = begin
-            m = config.deployment_target.match(/(\d+)/)
-            if m[0].to_i < 7
-              "-stdlib=libstdc++"
-            end
-          end || ""
-          sh "#{cxx} -o \"#{main_exec}\" #{objs_list} #{config.ldflags(platform)} -L#{File.join(datadir, platform)} -lrubymotion-static -lobjc -licucore #{linker_option} #{framework_search_paths} #{frameworks} #{weak_frameworks} #{extension.libs.join(' ')} #{vendor_libs}"
-          main_exec_created = true
-
-          # Change the install name of embedded frameworks.
-          embedded_frameworks.each do |path|
-            res = `/usr/bin/otool -L \"#{main_exec}\"`.scan(/(.*#{File.basename(path)}.*)\s\(/)
-            if res and res[0] and res[0][0]
-              old_path = res[0][0].strip
-              new_path = "@executable_path/../Frameworks/" + old_path.scan(/#{File.basename(path)}.*/)[0]
-              sh "/usr/bin/install_name_tool -change \"#{old_path}\" \"#{new_path}\" \"#{main_exec}\""
-            else
-              App.warn "Cannot locate and fix install name path of embedded framework `#{path}' in executable `#{main_exec}', application might not start"
-            end
-          end
-        end
+        link_executable(main_exec, should_link_executable, config, platform)
 
         # Create extension Info.plist.
         extension_info_plist = File.join(extension_path, 'Info.plist')
@@ -550,6 +206,7 @@ EOS
           File.open(extension_info_plist, 'w') { |io| io.write(extension.send("#{extension.type.gsub('-','_')}_plist_data", platform, config.identifier)) }
           sh "/usr/bin/plutil -convert binary1 \"#{extension_info_plist}\""
         end
+
       end
 
       # Create bundle/PkgInfo.
@@ -698,7 +355,7 @@ EOS
 
       # Optional support for #eval (OSX-only).
       if config.respond_to?(:eval_support) and config.eval_support
-        repl_dylib_path = File.join(datadir, '..', 'librubymotion-repl.dylib')
+        repl_dylib_path = File.join(config.datadir, '..', 'librubymotion-repl.dylib')
         dest_path = File.join(app_resources_dir, File.basename(repl_dylib_path))
         copy_resource(repl_dylib_path, dest_path)
         preserve_resources << File.basename(repl_dylib_path)
@@ -725,7 +382,7 @@ EOS
       end
 
       # Strip all symbols. Only in distribution mode.
-      if main_exec_created and (config.distribution_mode or ENV['__strip__'])
+      if @main_exec_created and (config.distribution_mode or ENV['__strip__'])
         App.info "Strip", main_exec
         sh "#{config.locate_binary('strip')} #{config.strip_args} \"#{main_exec}\""
       end
@@ -774,6 +431,161 @@ EOS
       instruments_app = File.expand_path('../Applications/Instruments.app', config.xcode_dir)
       App.info('Profile', config.app_bundle(platform))
       sh "'#{File.join(config.bindir, 'instruments')}' '#{instruments_app}' '#{plist_path}'"
+    end
+
+    def build_file(bs_files, config, platform)
+      archs = config.archs[platform]
+      project_files = Dir.glob("**/*.rb").map{ |x| File.expand_path(x) }
+      rubyc_bs_flags = bs_files.map { |x| "--uses-bs \"" + x + "\" " }.join(' ')
+      is_default_archs = (archs == config.default_archs[platform])
+
+      Proc.new do |files_build_dir, path|
+        rpath = path
+        path = File.expand_path(path)
+        if is_default_archs && !project_files.include?(path)
+          files_build_dir = File.expand_path(File.join(Builder.common_build_dir, files_build_dir))
+        end
+        obj = File.join(files_build_dir, "#{path}.o")
+        should_rebuild = (!File.exist?(obj) \
+            or File.mtime(path) > File.mtime(obj) \
+            or File.mtime(@ruby) > File.mtime(obj))
+
+        # Generate or retrieve init function.
+        init_func = should_rebuild ? "MREP_#{`/usr/bin/uuidgen`.strip.gsub('-', '')}" : `#{config.locate_binary('nm')} \"#{obj}\"`.scan(/T\s+_(MREP_.*)/)[0][0]
+
+        if should_rebuild
+          App.info 'Compile', rpath
+          FileUtils.mkdir_p(File.dirname(obj))
+          arch_objs = []
+          archs.each do |arch|
+            # Locate arch kernel.
+            kernel = File.join(config.datadir, platform, "kernel-#{arch}.bc")
+            raise "Can't locate kernel file" unless File.exist?(kernel)
+
+            # Assembly.
+            asm = File.join(files_build_dir, "#{path}.#{arch}.s")
+            arm64 = false
+            compiler_exec_arch = case arch
+              when /^arm/
+                (arm64 = (arch == 'arm64')) ? 'x86_64' : 'i386'
+              else
+                arch
+            end
+            sh "/usr/bin/env VM_PLATFORM=\"#{platform}\" VM_KERNEL_PATH=\"#{kernel}\" VM_OPT_LEVEL=\"#{config.opt_level}\" /usr/bin/arch -arch #{compiler_exec_arch} #{@ruby} #{rubyc_bs_flags} --emit-llvm \"#{asm}\" #{init_func} \"#{path}\""
+
+            # Object
+            arch_obj = File.join(files_build_dir, "#{path}.#{arch}.o")
+            if arm64
+              # At the time of this writing Apple hasn't yet contributed the source code of the LLVM backend for the "arm64" architecture, so the RubyMotion compiler can't emit proper assembly yet. We work around this limitation by generating bitcode instead and giving it to the linker. Ugly but should be temporary (right?).
+              @dummy_object_file ||= begin
+                src_path = '/tmp/__dummy_object_file__.c'
+                obj_path = '/tmp/__dummy_object_file__.o'
+                File.open(src_path, 'w') { |io| io.puts "static int foo(void) { return 42; }" }
+                sh "#{@cc} -c #{src_path} -o #{obj_path} -arch arm64 -miphoneos-version-min=7.0"
+                obj_path
+              end
+              ld_path = File.join(App.config.xcode_dir, 'Toolchains/XcodeDefault.xctoolchain/usr/bin/ld')
+              sh "#{ld_path} \"#{asm}\" \"#{@dummy_object_file}\" -arch arm64 -r -o \"#{arch_obj}\""
+            else
+              sh "#{@cc} -fexceptions -c -arch #{arch} \"#{asm}\" -o \"#{arch_obj}\""
+            end
+
+            [asm].each { |x| File.unlink(x) } unless ENV['keep_temps']
+            arch_objs << arch_obj
+          end
+
+          # Assemble fat binary.
+          arch_objs_list = arch_objs.map { |x| "\"#{x}\"" }.join(' ')
+          sh "/usr/bin/lipo -create #{arch_objs_list} -output \"#{obj}\""
+        end
+
+        @any_obj_file_built = true
+        [obj, init_func]
+      end
+    end
+
+    def build_init_file(app_objs, objs_build_dir, config, platform, filename = 'init')
+      init_txt = config.init_cpp_file_txt(app_objs)
+
+      init = File.join(objs_build_dir, "#{filename}.mm")
+      init_o = File.join(objs_build_dir, "#{filename}.o")
+      if !(File.exist?(init) and File.exist?(init_o) and File.read(init) == init_txt)
+        File.open(init, 'w') { |io| io.write(init_txt) }
+        sh "#{@cxx} \"#{init}\" #{config.cflags(platform, true)} -c -o \"#{init_o}\""
+      end
+
+      init_o
+    end
+
+    def build_main_file(spec_objs, objs_build_dir, config, platform)
+      main_txt = config.main_cpp_file_txt(spec_objs)
+
+      main = File.join(objs_build_dir, 'main.mm')
+      main_o = File.join(objs_build_dir, 'main.o')
+      if !(File.exist?(main) and File.exist?(main_o) and File.read(main) == main_txt)
+        File.open(main, 'w') { |io| io.write(main_txt) }
+        sh "#{@cxx} \"#{main}\" #{config.cflags(platform, true)} -c -o \"#{main_o}\""
+      end
+
+      main_o
+    end
+
+    def build_extension_main_file(spec_objs, objs_build_dir, config, platform)
+      extension_main_txt = config.extension_main_cpp_file_txt(spec_objs)
+
+      extension_main = File.join(objs_build_dir, 'extension_main.mm')
+      extension_main_o = File.join(objs_build_dir, 'extension_main.o')
+      if !(File.exist?(extension_main) and File.exist?(extension_main_o) and File.read(extension_main) == extension_main_txt)
+        File.open(extension_main, 'w') { |io| io.write(extension_main_txt) }
+        sh "#{@cxx} \"#{extension_main}\" #{config.cflags(platform, true)} -c -o \"#{extension_main_o}\""
+      end
+
+      extension_main_o
+    end
+
+    def link_executable(main_exec, should_link_executable, config, platform)
+      unless File.exist?(File.dirname(main_exec))
+        App.info 'Create', File.dirname(main_exec)
+        FileUtils.mkdir_p(File.dirname(main_exec))
+      end
+      @main_exec_created = false
+      if should_link_executable
+        App.info 'Link', main_exec
+        objs_list = objs.map { |path, _| path }.unshift(init_o, main_o, *config.frameworks_stubs_objects(platform)).map { |x| "\"#{x}\"" }.join(' ')
+        framework_search_paths = (config.framework_search_paths + (embedded_frameworks + external_frameworks).map { |x| File.dirname(x) }).uniq.map { |x| "-F '#{File.expand_path(x)}'" }.join(' ')
+        frameworks = (config.frameworks_dependencies + (embedded_frameworks + external_frameworks).map { |x| File.basename(x, '.framework') }).map { |x| "-framework #{x}" }.join(' ')
+        weak_frameworks = config.weak_frameworks.map { |x| "-weak_framework #{x}" }.join(' ')
+        vendor_libs = config.vendor_projects.inject([]) do |libs, vendor_project|
+          libs << vendor_project.libs.map { |x|
+            (vendor_project.opts[:force_load] ? '-force_load ' : '-ObjC ') + "\"#{x}\""
+          }
+        end.join(' ')
+        linker_option = begin
+          m = config.deployment_target.match(/(\d+)/)
+          if m[0].to_i < 7
+            "-stdlib=libstdc++"
+          end
+        end || ""
+        sh "#{@cxx} -o \"#{main_exec}\" #{objs_list} #{config.ldflags(platform)} -L#{File.join(config.datadir, platform)} -lrubymotion-static -lobjc -licucore #{linker_option} #{framework_search_paths} #{frameworks} #{weak_frameworks} #{config.libs.join(' ')} #{vendor_libs}"
+        @main_exec_created = true
+
+        # Change the install name of embedded frameworks.
+        embedded_frameworks.each do |path|
+          res = `/usr/bin/otool -L \"#{main_exec}\"`.scan(/(.*#{File.basename(path)}.*)\s\(/)
+          if res and res[0] and res[0][0]
+            old_path = res[0][0].strip
+            if platform == "MacOSX"
+              exec_path = "@executable_path/../Frameworks/"
+            else
+              exec_path = "@executable_path/Frameworks/"
+            end
+            new_path = exec_path + old_path.scan(/#{File.basename(path)}.*/)[0]
+            sh "/usr/bin/install_name_tool -change \"#{old_path}\" \"#{new_path}\" \"#{main_exec}\""
+          else
+            App.warn "Cannot locate and fix install name path of embedded framework `#{path}' in executable `#{main_exec}', application might not start"
+          end
+        end
+      end
     end
 
     class << self

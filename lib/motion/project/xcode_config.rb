@@ -571,5 +571,61 @@ EOS
 EOS
     end
 
+    def init_cpp_file_txt(app_objs)
+      init_txt = <<EOS
+extern "C" {
+    void ruby_sysinit(int *, char ***);
+    void ruby_init(void);
+    void ruby_init_loadpath(void);
+    void ruby_script(const char *);
+    void ruby_set_argv(int, char **);
+    void rb_vm_init_compiler(void);
+    void rb_vm_init_jit(void);
+    void rb_vm_aot_feature_provide(const char *, void *);
+    void *rb_vm_top_self(void);
+    void rb_define_global_const(const char *, void *);
+    void rb_rb2oc_exc_handler(void);
+    void rb_exit(int);
+EOS
+      app_objs.each do |_, init_func|
+        init_txt << "void #{init_func}(void *, void *);\n"
+      end
+      init_txt << <<EOS
+}
+
+extern "C"
+void
+RubyMotionInit(int argc, char **argv)
+{
+    static bool initialized = false;
+    if (!initialized) {
+  ruby_init();
+  ruby_init_loadpath();
+        if (argc > 0) {
+      const char *progname = argv[0];
+      ruby_script(progname);
+  }
+#if !__LP64__
+  try {
+#endif
+      void *self = rb_vm_top_self();
+EOS
+      init_txt << self.define_global_env_txt
+      app_objs.each do |_, init_func|
+        init_txt << "#{init_func}(self, 0);\n"
+      end
+      init_txt << <<EOS
+#if !__LP64__
+  }
+  catch (...) {
+      rb_rb2oc_exc_handler();
+  }
+#endif
+  initialized = true;
+    }
+}
+EOS
+    end
+
   end
 end; end
