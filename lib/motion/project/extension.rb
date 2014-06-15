@@ -45,6 +45,10 @@ module Motion; module Project;
       end
     end
 
+    def extension_path(platform)
+      File.join(config.app_extensions_dir(platform), [config.identifier, @name, 'appex'].join('.'))
+    end
+
     def vendor_project(path, type, opts={})
       opts[:force_load] = true unless opts[:force_load] == false
       @vendor_projects << Motion::Project::Vendor.new(File.join(project_dir, path), type, self, opts)
@@ -52,6 +56,10 @@ module Motion; module Project;
 
     def unvendor_project(path)
       @vendor_projects.delete_if { |x| x.path == File.join(project_dir, path) }
+    end
+
+    def app_resources_dir(platform)
+      extension_path(platform)
     end
 
     def platforms; config.platforms; end

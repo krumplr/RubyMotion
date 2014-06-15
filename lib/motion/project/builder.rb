@@ -36,8 +36,6 @@ module Motion; module Project;
         exit 1
       end
 
-      static_library = opts.delete(:static)
-
       @ruby = File.join(config.bindir, 'ruby')
       @nfd = File.join(config.bindir, 'nfd')
 
@@ -57,39 +55,27 @@ module Motion; module Project;
       App.info 'Build', build_dir
 
       # Prepare the list of BridgeSupport files needed.
-      bs_files = config.bridgesupport_files
+      @bs_files = config.bridgesupport_files
 
       # Build vendor libraries.
-      vendor_libs = []
-      config.vendor_projects.each do |vendor_project|
-        vendor_project.build(platform)
-        vendor_libs.concat(vendor_project.libs)
-        bs_files.concat(vendor_project.bs_files)
+      vendor_libs = build_vendor_libs(config, platform)
+
+      # Validate common build directory.
+      if !File.directory?(Builder.common_build_dir) or !File.writable?(Builder.common_build_dir)
+        $stderr.puts "Cannot write into the `#{Builder.common_build_dir}' directory, please remove or check permissions and try again."
+        exit 1
       end
 
-      # Prepare embedded and external frameworks BridgeSupport files
-      if config.respond_to?(:embedded_frameworks) && config.respond_to?(:external_frameworks)
-        embedded_frameworks = config.embedded_frameworks.map { |x| File.expand_path(x) }
-        external_frameworks = config.external_frameworks.map { |x| File.expand_path(x) }
-        (embedded_frameworks + external_frameworks).each do |path|
-          headers = Dir.glob(File.join(path, 'Headers/**/*.h'))
-          bs_file = File.join(Builder.common_build_dir, File.expand_path(path) + '.bridgesupport')
-          if !File.exist?(bs_file) or File.mtime(path) > File.mtime(bs_file)
-            FileUtils.mkdir_p(File.dirname(bs_file))
-            config.gen_bridge_metadata(platform, headers, bs_file, '', [])
-          end
-          bs_files << bs_file
-        end
-      else
-        embedded_frameworks = external_frameworks = []
-      end
+      # Prepare embedded and external frameworks BridgeSupport files (OSX-only).
+      embedded_frameworks = prepare_embedded_frameworks(config, platform)
+      external_frameworks = prepare_external_frameworks(config, platform)
 
       # Build object files.
       objs_build_dir = File.join(build_dir, 'objs')
       FileUtils.mkdir_p(objs_build_dir)
       @any_obj_file_built = false
 
-      build_file = build_file(bs_files, config, platform)
+      build_file = build_file(config, platform)
 
       # Resolve file dependencies.
       if config.detect_dependencies == true
@@ -111,6 +97,8 @@ module Motion; module Project;
       # Generate init file.
       init_o = build_init_file(app_objs, objs_build_dir, config, platform)
 
+      # Build static library if the option is set
+      static_library = opts.delete(:static)
       librubymotion = File.join(config.datadir, platform, 'librubymotion-static.a')
       if static_library
         # Create a static archive with all object files + the runtime.
@@ -147,28 +135,23 @@ module Motion; module Project;
         or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(main_exec) } \
         or File.mtime(librubymotion) > File.mtime(main_exec)
 
-      link_executable(main_exec, should_link_executable, config, platform)
+      main_exec_created = link_executable(main_exec, objs, init_o, main_o, embedded_frameworks, external_frameworks, should_link_executable, config, platform)
 
       # Build extensions
       config.extensions.each do |extension|
 
         # Prepare the list of BridgeSupport files needed.
-        bs_files = extension.bridgesupport_files
+        @bs_files = extension.bridgesupport_files
 
         # Build vendor libraries.
-        vendor_libs = []
-        extension.vendor_projects.each do |vendor_project|
-          vendor_project.build(platform)
-          vendor_libs.concat(vendor_project.libs)
-          bs_files.concat(vendor_project.bs_files)
-        end
+        vendor_libs = build_vendor_libs(extension, platform)
 
         # Build object files.
         objs_build_dir = File.join(build_dir, 'objs')
         FileUtils.mkdir_p(objs_build_dir)
         @any_obj_file_built = false
 
-        build_file = build_file(bs_files, extension, platform)
+        build_file = build_file(extension, platform)
 
         # Resolve file dependencies.
         if extension.detect_dependencies == true
@@ -186,18 +169,18 @@ module Motion; module Project;
 
         FileUtils.touch(objs_build_dir) if @any_obj_file_built
 
-        extension_path = File.join(config.app_extensions_dir(platform), [config.identifier, extension.name, 'appex'].join('.'))
+        extension_path = extension.extension_path(platform)
 
         # Link executable
-        main_exec = File.join(extension_path, [config.identifier, extension.name].join('.'))
-        should_link_executable = !File.exist?(main_exec) \
-          or File.mtime(extension.project_file) > File.mtime(main_exec) \
-          or extension_objs.any? { |path, _| File.mtime(path) > File.mtime(main_exec) } \
-          or File.mtime(main_extension_o) > File.mtime(main_exec) \
-          or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(main_exec) } \
-          or File.mtime(librubymotion) > File.mtime(main_exec)
+        extension_exec = File.join(extension_path, [config.identifier, extension.name].join('.'))
+        should_link_executable = !File.exist?(extension_exec) \
+          or File.mtime(extension.project_file) > File.mtime(extension_exec) \
+          or extension_objs.any? { |path, _| File.mtime(path) > File.mtime(extension_exec) } \
+          or File.mtime(main_extension_o) > File.mtime(extension_exec) \
+          or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(extension_exec) } \
+          or File.mtime(librubymotion) > File.mtime(extension_exec)
 
-        link_executable(main_exec, should_link_executable, config, platform)
+        extension_exec_created = link_executable(extension_exec, extension_objs, init_o, main_extension_o, embedded_frameworks, external_frameworks, should_link_executable, config, platform)
 
         # Create extension Info.plist.
         extension_info_plist = File.join(extension_path, 'Info.plist')
@@ -205,6 +188,38 @@ module Motion; module Project;
           App.info 'Create', extension_info_plist
           File.open(extension_info_plist, 'w') { |io| io.write(extension.send("#{extension.type.gsub('-','_')}_plist_data", platform, config.identifier)) }
           sh "/usr/bin/plutil -convert binary1 \"#{extension_info_plist}\""
+        end
+
+        # Compile IB resources.
+        compile_ib_resources(extension)
+
+        @preserve_resources = []
+
+        # Compile CoreData Model resources and
+        compile_coredata_resources(extension)
+
+        # Comile SpriteKit atlas files
+        compile_spritekit_resources(config)
+
+        @reserved_app_bundle_files = [
+          '_CodeSignature/CodeResources', 'CodeResources', 'embedded.mobileprovision',
+          'Info.plist', 'PkgInfo', 'ResourceRules.plist',
+          convert_filesystem_encoding([config.identifier, extension.name].join('.'))
+        ]
+
+        # Copy resources, handle subdirectories.
+        resources_paths = copy_resources(extension, platform)
+
+        # Compile all .strings files
+        compile_string_files(extension, platform)
+
+        # Delete old resource files.
+        clean_resource_files(resources_paths, extension, platform)
+
+        # Strip all symbols. Only in distribution mode.
+        if extension_exec_created and (config.distribution_mode or ENV['__strip__'])
+          App.info "Strip", main_exec
+          sh "#{config.locate_binary('strip')} #{config.strip_args} \"#{main_exec}\""
         end
 
       end
@@ -217,95 +232,21 @@ module Motion; module Project;
       end
 
       # Compile IB resources.
-      config.resources_dirs.each do |dir|
-        if File.exist?(dir)
-          ib_resources = []
-          ib_resources.concat((Dir.glob(File.join(dir, '**', '*.xib')) + Dir.glob(File.join(dir, '*.lproj', '*.xib'))).map { |xib| [xib, xib.sub(/\.xib$/, '.nib')] })
-          ib_resources.concat(Dir.glob(File.join(dir, '**', '*.storyboard')).map { |storyboard| [storyboard, storyboard.sub(/\.storyboard$/, '.storyboardc')] })
-          ib_resources.each do |src, dest|
-            if !File.exist?(dest) or File.mtime(src) > File.mtime(dest)
-              App.info 'Compile', src
-              sh "/usr/bin/ibtool --compile \"#{dest}\" \"#{src}\""
-            end
-          end
-        end
-      end
+      compile_ib_resources(config)
 
-      preserve_resources = []
+      @preserve_resources = []
 
       # Compile Asset Catalog bundles.
-      assets_bundles = config.assets_bundles
-      unless assets_bundles.empty?
-        app_icons_asset_bundle = config.app_icons_asset_bundle
-        if app_icons_asset_bundle
-          app_icons_info_plist_path = config.app_icons_info_plist_path(platform)
-          app_icons_options = "--output-partial-info-plist \"#{app_icons_info_plist_path}\" " \
-                              "--app-icon \"#{config.app_icon_name_from_asset_bundle}\""
-        end
+      compile_asset_catalog_bundles(config, platform)
 
-        App.info 'Compile', assets_bundles.join(", ")
-        app_resources_dir = File.expand_path(config.app_resources_dir(platform))
-        FileUtils.mkdir_p(app_resources_dir)
-        cmd = "\"#{config.xcode_dir}/usr/bin/actool\" --output-format human-readable-text " \
-              "--notices --warnings --platform #{config.deploy_platform.downcase} " \
-              "--minimum-deployment-target #{config.deployment_target} " \
-              "#{Array(config.device_family).map { |d| "--target-device #{d}" }.join(' ')} " \
-              "#{app_icons_options} --compress-pngs --compile \"#{app_resources_dir}\" " \
-              "\"#{assets_bundles.map { |f| File.expand_path(f) }.join('" "')}\""
-        $stderr.puts(cmd) if App::VERBOSE
-        actool_output = `#{cmd} 2>&1`
-        $stderr.puts(actool_output) if App::VERBOSE
+      # Compile CoreData Model resources and
+      compile_coredata_resources(config)
 
-        # Split output in warnings and compiled files
-        actool_output, actool_compilation_results = actool_output.split('/* com.apple.actool.compilation-results */')
-        actool_compiled_files = actool_compilation_results.strip.split("\n")
-        if actool_document_warnings = actool_output.split('/* com.apple.actool.document.warnings */').last
-          # Propagate warnings to the user.
-          actool_document_warnings.strip.split("\n").each { |w| App.warn(w) }
-        end
-
-        # Remove the partial Info.plist line and preserve all other assets.
-        actool_compiled_files.delete(app_icons_info_plist_path) if app_icons_asset_bundle
-        preserve_resources.concat(actool_compiled_files.map { |f| File.basename(f) })
-
-        config.configure_app_icons_from_asset_bundle(platform) if app_icons_asset_bundle
-      end
-
-      # Compile CoreData Model resources and SpriteKit atlas files.
-      config.resources_dirs.each do |dir|
-        if File.exist?(dir)
-          Dir.glob(File.join(dir, '*.xcdatamodeld')).each do |model|
-            momd = model.sub(/\.xcdatamodeld$/, '.momd')
-            if !File.exist?(momd) or File.mtime(model) > File.mtime(momd)
-              App.info 'Compile', model
-              model = File.expand_path(model) # momc wants absolute paths.
-              momd = File.expand_path(momd)
-              sh "\"#{App.config.xcode_dir}/usr/bin/momc\" \"#{model}\" \"#{momd}\""
-            end
-          end
-          if cmd = config.spritekit_texture_atlas_compiler
-            Dir.glob(File.join(dir, '*.atlas')).each do |atlas|
-              if File.directory?(atlas)
-                App.info 'Compile', atlas
-                sh "\"#{cmd}\" \"#{atlas}\" \"#{bundle_path}\""
-              end
-            end
-          end
-        end
-      end
+      # Comile SpriteKit atlas files
+      compile_spritekit_resources(config)
 
       # Copy embedded frameworks.
-      unless embedded_frameworks.empty?
-        app_frameworks = File.join(config.app_bundle(platform), 'Frameworks')
-        FileUtils.mkdir_p(app_frameworks)
-        embedded_frameworks.each do |src_path|
-          dest_path = File.join(app_frameworks, File.basename(src_path))
-          if !File.exist?(dest_path) or File.mtime(src_path) > File.mtime(dest_path)
-            App.info 'Copy', src_path
-            FileUtils.cp_r(src_path, dest_path)
-          end
-        end
-      end
+      copy_embedded_frameworks(embedded_frameworks, config, platform)
 
       # Create bundle/Info.plist.
       bundle_info_plist = File.join(bundle_path, 'Info.plist')
@@ -315,64 +256,28 @@ module Motion; module Project;
         sh "/usr/bin/plutil -convert binary1 \"#{bundle_info_plist}\""
       end
 
-      # Copy resources, handle subdirectories.
-      app_resources_dir = config.app_resources_dir(platform)
-      FileUtils.mkdir_p(app_resources_dir)
-      reserved_app_bundle_files = [
+      @reserved_app_bundle_files = [
         '_CodeSignature/CodeResources', 'CodeResources', 'embedded.mobileprovision',
         'Info.plist', 'PkgInfo', 'ResourceRules.plist',
         convert_filesystem_encoding(config.name)
       ]
-      resources_exclude_extnames = ['.xib', '.storyboard', '.xcdatamodeld', '.atlas', '.xcassets']
-      resources_paths = []
-      config.resources_dirs.each do |dir|
-        if File.exist?(dir)
-          resources_paths << Dir.chdir(dir) do
-            Dir.glob('**{,/*/**}/*').reject do |x|
-              # Find files with extnames to exclude or files inside bundles to
-              # exclude (e.g. xcassets).
-              File.extname(x) == '.lproj' ||
-                resources_exclude_extnames.include?(File.extname(x)) ||
-                  resources_exclude_extnames.include?(File.extname(x.split('/').first))
-            end.map { |file| File.join(dir, file) }
-          end
-        end
-      end
-      resources_paths.flatten!
-      resources_paths.each do |res_path|
-        res = path_on_resources_dirs(config.resources_dirs, res_path)
-        if reserved_app_bundle_files.include?(res)
-          App.fail "Cannot use `#{res_path}' as a resource file because it's a reserved application bundle file"
-        end
-        dest_path = File.join(app_resources_dir, res)
-        copy_resource(res_path, dest_path)
-      end
+
+      # Copy resources, handle subdirectories.
+      resources_paths = copy_resources(config, platform)
 
       # Compile all .strings files
-      Dir.glob(File.join(app_resources_dir, '{,**/}*.strings')).each do |strings_file|
-        compile_resource_to_binary_plist(strings_file)
-      end
+      compile_string_files(config, platform)
 
       # Optional support for #eval (OSX-only).
       if config.respond_to?(:eval_support) and config.eval_support
         repl_dylib_path = File.join(config.datadir, '..', 'librubymotion-repl.dylib')
         dest_path = File.join(app_resources_dir, File.basename(repl_dylib_path))
         copy_resource(repl_dylib_path, dest_path)
-        preserve_resources << File.basename(repl_dylib_path)
+        @preserve_resources << File.basename(repl_dylib_path)
       end
 
       # Delete old resource files.
-      resources_files = resources_paths.map { |x| path_on_resources_dirs(config.resources_dirs, x) }
-      Dir.chdir(app_resources_dir) do
-        Dir.glob('*').each do |bundle_res|
-          next if File.directory?(bundle_res)
-          next if reserved_app_bundle_files.include?(bundle_res)
-          next if resources_files.include?(bundle_res)
-          next if preserve_resources.include?(File.basename(bundle_res))
-          App.warn "File `#{bundle_res}' found in app bundle but not in resource directories, removing"
-          FileUtils.rm_rf(bundle_res)
-        end
-      end
+      clean_resource_files(resources_paths, config, platform)
 
       # Generate dSYM.
       dsym_path = config.app_bundle_dsym(platform)
@@ -382,7 +287,7 @@ module Motion; module Project;
       end
 
       # Strip all symbols. Only in distribution mode.
-      if @main_exec_created and (config.distribution_mode or ENV['__strip__'])
+      if main_exec_created and (config.distribution_mode or ENV['__strip__'])
         App.info "Strip", main_exec
         sh "#{config.locate_binary('strip')} #{config.strip_args} \"#{main_exec}\""
       end
@@ -433,10 +338,10 @@ module Motion; module Project;
       sh "'#{File.join(config.bindir, 'instruments')}' '#{instruments_app}' '#{plist_path}'"
     end
 
-    def build_file(bs_files, config, platform)
+    def build_file(config, platform)
       archs = config.archs[platform]
       project_files = Dir.glob("**/*.rb").map{ |x| File.expand_path(x) }
-      rubyc_bs_flags = bs_files.map { |x| "--uses-bs \"" + x + "\" " }.join(' ')
+      rubyc_bs_flags = @bs_files.map { |x| "--uses-bs \"" + x + "\" " }.join(' ')
       is_default_archs = (archs == config.default_archs[platform])
 
       Proc.new do |files_build_dir, path|
@@ -543,12 +448,12 @@ module Motion; module Project;
       extension_main_o
     end
 
-    def link_executable(main_exec, should_link_executable, config, platform)
+    def link_executable(main_exec, objs, init_o, main_o, embedded_frameworks, external_frameworks, should_link_executable, config, platform)
       unless File.exist?(File.dirname(main_exec))
         App.info 'Create', File.dirname(main_exec)
         FileUtils.mkdir_p(File.dirname(main_exec))
       end
-      @main_exec_created = false
+      main_exec_created = false
       if should_link_executable
         App.info 'Link', main_exec
         objs_list = objs.map { |path, _| path }.unshift(init_o, main_o, *config.frameworks_stubs_objects(platform)).map { |x| "\"#{x}\"" }.join(' ')
@@ -567,7 +472,7 @@ module Motion; module Project;
           end
         end || ""
         sh "#{@cxx} -o \"#{main_exec}\" #{objs_list} #{config.ldflags(platform)} -L#{File.join(config.datadir, platform)} -lrubymotion-static -lobjc -licucore #{linker_option} #{framework_search_paths} #{frameworks} #{weak_frameworks} #{config.libs.join(' ')} #{vendor_libs}"
-        @main_exec_created = true
+        main_exec_created = true
 
         # Change the install name of embedded frameworks.
         embedded_frameworks.each do |path|
@@ -585,6 +490,193 @@ module Motion; module Project;
             App.warn "Cannot locate and fix install name path of embedded framework `#{path}' in executable `#{main_exec}', application might not start"
           end
         end
+      end
+      main_exec_created
+    end
+
+    def compile_ib_resources(config)
+      config.resources_dirs.each do |dir|
+        if File.exist?(dir)
+          ib_resources = []
+          ib_resources.concat((Dir.glob(File.join(dir, '**', '*.xib')) + Dir.glob(File.join(dir, '*.lproj', '*.xib'))).map { |xib| [xib, xib.sub(/\.xib$/, '.nib')] })
+          ib_resources.concat(Dir.glob(File.join(dir, '**', '*.storyboard')).map { |storyboard| [storyboard, storyboard.sub(/\.storyboard$/, '.storyboardc')] })
+          ib_resources.each do |src, dest|
+            if !File.exist?(dest) or File.mtime(src) > File.mtime(dest)
+              App.info 'Compile', src
+              sh "/usr/bin/ibtool --compile \"#{dest}\" \"#{src}\""
+            end
+          end
+        end
+      end
+    end
+
+    def compile_coredata_resources(config)
+      config.resources_dirs.each do |dir|
+        if File.exist?(dir)
+          Dir.glob(File.join(dir, '*.xcdatamodeld')).each do |model|
+            momd = model.sub(/\.xcdatamodeld$/, '.momd')
+            if !File.exist?(momd) or File.mtime(model) > File.mtime(momd)
+              App.info 'Compile', model
+              model = File.expand_path(model) # momc wants absolute paths.
+              momd = File.expand_path(momd)
+              sh "\"#{App.config.xcode_dir}/usr/bin/momc\" \"#{model}\" \"#{momd}\""
+            end
+          end
+        end
+      end
+    end
+
+    def compile_spritekit_resources(config)
+      config.resources_dirs.each do |dir|
+        if File.exist?(dir) && cmd = config.spritekit_texture_atlas_compiler
+          Dir.glob(File.join(dir, '*.atlas')).each do |atlas|
+            if File.directory?(atlas)
+              App.info 'Compile', atlas
+              sh "\"#{cmd}\" \"#{atlas}\" \"#{bundle_path}\""
+            end
+          end
+        end
+      end
+    end
+
+    def copy_embedded_frameworks(embedded_frameworks, config, platform)
+      unless embedded_frameworks.empty?
+        app_frameworks = File.join(config.app_bundle(platform), 'Frameworks')
+        FileUtils.mkdir_p(app_frameworks)
+        embedded_frameworks.each do |src_path|
+          dest_path = File.join(app_frameworks, File.basename(src_path))
+          if !File.exist?(dest_path) or File.mtime(src_path) > File.mtime(dest_path)
+            App.info 'Copy', src_path
+            FileUtils.cp_r(src_path, dest_path)
+          end
+        end
+      end
+    end
+
+    def copy_resources(config, platform)
+      app_resources_dir = config.app_resources_dir(platform)
+      FileUtils.mkdir_p(app_resources_dir)
+      resources_exclude_extnames = ['.xib', '.storyboard', '.xcdatamodeld', '.atlas', '.xcassets']
+      resources_paths = []
+      config.resources_dirs.each do |dir|
+        if File.exist?(dir)
+          resources_paths << Dir.chdir(dir) do
+            Dir.glob('**{,/*/**}/*').reject do |x|
+              # Find files with extnames to exclude or files inside bundles to
+              # exclude (e.g. xcassets).
+              File.extname(x) == '.lproj' ||
+                resources_exclude_extnames.include?(File.extname(x)) ||
+                  resources_exclude_extnames.include?(File.extname(x.split('/').first))
+            end.map { |file| File.join(dir, file) }
+          end
+        end
+      end
+      resources_paths.flatten!
+      resources_paths.each do |res_path|
+        res = path_on_resources_dirs(config.resources_dirs, res_path)
+        if @reserved_app_bundle_files.include?(res)
+          App.fail "Cannot use `#{res_path}' as a resource file because it's a reserved application bundle file"
+        end
+        dest_path = File.join(app_resources_dir, res)
+        copy_resource(res_path, dest_path)
+      end
+
+      resources_paths
+    end
+
+    def clean_resource_files(resources_paths, config, platform)
+      app_resources_dir = config.app_resources_dir(platform)
+      resources_files = resources_paths.map { |x| path_on_resources_dirs(config.resources_dirs, x) }
+      Dir.chdir(app_resources_dir) do
+        Dir.glob('*').each do |bundle_res|
+          next if File.directory?(bundle_res)
+          next if @reserved_app_bundle_files.include?(bundle_res)
+          next if resources_files.include?(bundle_res)
+          next if @preserve_resources.include?(File.basename(bundle_res))
+          App.warn "File `#{bundle_res}' found in app bundle but not in resource directories, removing"
+          FileUtils.rm_rf(bundle_res)
+        end
+      end
+    end
+
+    def compile_string_files(config, platform)
+      app_resources_dir = config.app_resources_dir(platform)
+      Dir.glob(File.join(app_resources_dir, '{,**/}*.strings')).each do |strings_file|
+        compile_resource_to_binary_plist(strings_file)
+      end
+    end
+
+    def prepare_embedded_frameworks(config, platform)
+      if config.respond_to?(:embedded_frameworks)
+        embedded_frameworks = config.embedded_frameworks.map { |x| File.expand_path(x) }
+      else
+        []
+      end
+    end
+
+    def prepare_external_frameworks(config, platform)
+      if config.respond_to?(:external_frameworks)
+        external_frameworks = config.external_frameworks.map { |x| File.expand_path(x) }
+        (embedded_frameworks + external_frameworks).each do |path|
+          headers = Dir.glob(File.join(path, 'Headers/**/*.h'))
+          bs_file = File.join(Builder.common_build_dir, File.expand_path(path) + '.bridgesupport')
+          if !File.exist?(bs_file) or File.mtime(path) > File.mtime(bs_file)
+            FileUtils.mkdir_p(File.dirname(bs_file))
+            config.gen_bridge_metadata(platform, headers, bs_file, '', [])
+          end
+          @bs_files << bs_file
+        end
+      else
+        []
+      end
+    end
+
+    def build_vendor_libs(config, platform)
+      vendor_libs = []
+      config.vendor_projects.each do |vendor_project|
+        vendor_project.build(platform)
+        vendor_libs.concat(vendor_project.libs)
+        @bs_files.concat(vendor_project.bs_files)
+      end
+      vendor_libs
+    end
+
+    def compile_asset_catalog_bundles(config, platform)
+      assets_bundles = config.assets_bundles
+      unless assets_bundles.empty?
+        app_icons_asset_bundle = config.app_icons_asset_bundle
+        if app_icons_asset_bundle
+          app_icons_info_plist_path = config.app_icons_info_plist_path(platform)
+          app_icons_options = "--output-partial-info-plist \"#{app_icons_info_plist_path}\" " \
+                              "--app-icon \"#{config.app_icon_name_from_asset_bundle}\""
+        end
+
+        App.info 'Compile', assets_bundles.join(", ")
+        app_resources_dir = File.expand_path(config.app_resources_dir(platform))
+        FileUtils.mkdir_p(app_resources_dir)
+        cmd = "\"#{config.xcode_dir}/usr/bin/actool\" --output-format human-readable-text " \
+              "--notices --warnings --platform #{config.deploy_platform.downcase} " \
+              "--minimum-deployment-target #{config.deployment_target} " \
+              "#{Array(config.device_family).map { |d| "--target-device #{d}" }.join(' ')} " \
+              "#{app_icons_options} --compress-pngs --compile \"#{app_resources_dir}\" " \
+              "\"#{assets_bundles.map { |f| File.expand_path(f) }.join('" "')}\""
+        $stderr.puts(cmd) if App::VERBOSE
+        actool_output = `#{cmd} 2>&1`
+        $stderr.puts(actool_output) if App::VERBOSE
+
+        # Split output in warnings and compiled files
+        actool_output, actool_compilation_results = actool_output.split('/* com.apple.actool.compilation-results */')
+        actool_compiled_files = actool_compilation_results.strip.split("\n")
+        if actool_document_warnings = actool_output.split('/* com.apple.actool.document.warnings */').last
+          # Propagate warnings to the user.
+          actool_document_warnings.strip.split("\n").each { |w| App.warn(w) }
+        end
+
+        # Remove the partial Info.plist line and preserve all other assets.
+        actool_compiled_files.delete(app_icons_info_plist_path) if app_icons_asset_bundle
+        @preserve_resources.concat(actool_compiled_files.map { |f| File.basename(f) })
+
+        config.configure_app_icons_from_asset_bundle(platform) if app_icons_asset_bundle
       end
     end
 
