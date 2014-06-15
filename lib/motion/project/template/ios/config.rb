@@ -335,6 +335,10 @@ module Motion; module Project;
       app_bundle(platform)
     end
 
+    def app_extensions_dir(platform)
+      File.join(app_bundle(platform), 'PlugIns')
+    end
+
     def fonts
       @fonts ||= begin
         resources_dirs.flatten.inject([]) do |fonts, dir|

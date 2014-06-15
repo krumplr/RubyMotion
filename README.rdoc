@@ -1,3 +1,37 @@
+This is a fork of the official RubyMotion toolchain which adds support for iOS 8 and OSX 10.10 extensions.
+
+At this point it is very fragile and should not be used for anything other than playing around.
+
+To install it:
+
+`rake install`
+
+To uninstallit
+
+`rake uninstall`
+
+
+This is pretty much everything you can do right now:
+
+1- Create a Rubymotion project
+
+`motion create my-app && cd my-app`
+
+2- Create a new Today extension
+
+`motion extension ios-today-extension my-today-extension`
+
+3- Compile and run the app in the simulator
+
+`rake`
+
+4- Modify `today_extension_controller.rb` to do something else
+
+
+I have added templates for other iOS extension types, but I cannot assure they work. For more information do `motion extension --help`
+
+TODO: Everything, but I plan to continue improving this.
+
 = RubyMotion
 
 RubyMotion is a commercial toolchain for iOS and OS X development using the
@@ -28,7 +62,7 @@ When you would like to go back to original installation,
 you can run +rake uninstall+ within directory of git repository.
 
   $ rake uninstall
-  
+
 ---------------
 
 If you are looking to modify the +motion+ command itself, you'll need to mimick your existing +/usr/bin/motion+
@@ -39,7 +73,7 @@ An easy way is to just make a copy somewhere on your $PATH and use that for test
 
 Edit +motionme+ and point the $motion_libdir variable at your local git repo.
   $motion_libdir = '/Absolute/Path/To/Forked/RubyMotion/lib/'
-  
+
 Now using +motionme+ instead of +motion+ will use the forked RubyMotion
 
 == Contributions

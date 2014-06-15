@@ -2,16 +2,16 @@
 
 # Copyright (c) 2012, HipByte SPRL and contributors
 # All rights reserved.
-# 
+#
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions are met:
-# 
+#
 # 1. Redistributions of source code must retain the above copyright notice, this
 #    list of conditions and the following disclaimer.
 # 2. Redistributions in binary form must reproduce the above copyright notice,
 #    this list of conditions and the following disclaimer in the documentation
 #    and/or other materials provided with the distribution.
-# 
+#
 # THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS" AND
 # ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED
 # WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
@@ -31,7 +31,7 @@ module Motion; module Project;
     variable :xcode_dir, :sdk_version, :deployment_target, :frameworks,
       :weak_frameworks, :embedded_frameworks, :external_frameworks, :framework_search_paths,
       :libs, :identifier, :codesign_certificate, :short_version, :entitlements, :delegate_class,
-      :version
+      :version, :extensions
 
     def initialize(project_dir, build_mode)
       super
@@ -50,6 +50,15 @@ module Motion; module Project;
       @spec_mode = false
       @vendor_projects = []
       @version = '1.0'
+      @extensions = []
+    end
+
+    def extension(&block)
+      # TODO Find a better way to get the extension's dir
+      extension_dir = eval("File.dirname(__FILE__)", block.binding)
+      extension = Motion::Project::Extension.new(extension_dir, @build_mode, self)
+      block.call(extension)
+      @extensions << extension
     end
 
     def xcode_dir
@@ -109,7 +118,7 @@ EOS
         sdk_path = File.join(platforms_dir, platform + '.platform',
             "Developer/SDKs/#{platform}#{sdk_version}.sdk")
         unless File.exist?(sdk_path)
-          App.fail "Can't locate #{platform} SDK #{sdk_version} at `#{sdk_path}'" 
+          App.fail "Can't locate #{platform} SDK #{sdk_version} at `#{sdk_path}'"
         end
       end
 
@@ -291,7 +300,7 @@ EOS
         'CFBundleName' => @name,
         'CFBundleDisplayName' => @name,
         'CFBundleIdentifier' => identifier,
-        'CFBundleExecutable' => @name, 
+        'CFBundleExecutable' => @name,
         'CFBundleInfoDictionaryVersion' => '6.0',
         'CFBundlePackageType' => 'APPL',
         'CFBundleShortVersionString' => (@short_version || @version),
@@ -454,5 +463,113 @@ EOS
       super
       @vendor_projects.each { |vendor| vendor.clean }
     end
+
+
+    def extension_main_cpp_file_txt(spec_objs)
+      main_txt = <<EOS
+#import <UIKit/UIKit.h>
+
+extern "C" {
+    void rb_define_global_const(const char *, void *);
+    void rb_rb2oc_exc_handler(void);
+    void rb_exit(int);
+    void RubyMotionInit(int argc, char **argv);
+    void* dlopen(const char* path, int mode);
+    id objc_msgSend(id self, SEL op, ...);
+EOS
+      if spec_mode
+        spec_objs.each do |_, init_func|
+          main_txt << "void #{init_func}(void *, void *);\n"
+        end
+      end
+      main_txt << <<EOS
+}
+EOS
+
+      if spec_mode
+        main_txt << <<EOS
+@interface SpecLauncher : NSObject
+@end
+
+#include <dlfcn.h>
+
+@implementation SpecLauncher
+
++ (id)launcher
+{
+    [UIApplication sharedApplication];
+
+    // Enable simulator accessibility.
+    // Thanks http://www.stewgleadow.com/blog/2011/10/14/enabling-accessibility-for-ios-applications/
+    NSString *simulatorRoot = [[[NSProcessInfo processInfo] environment] objectForKey:@"IPHONE_SIMULATOR_ROOT"];
+    if (simulatorRoot != nil) {
+        void *appSupportLibrary = dlopen([[simulatorRoot stringByAppendingPathComponent:@"/System/Library/PrivateFrameworks/AppSupport.framework/AppSupport"] fileSystemRepresentation], RTLD_LAZY);
+        CFStringRef (*copySharedResourcesPreferencesDomainForDomain)(CFStringRef domain) = (CFStringRef (*)(CFStringRef)) dlsym(appSupportLibrary, "CPCopySharedResourcesPreferencesDomainForDomain");
+
+        if (copySharedResourcesPreferencesDomainForDomain != NULL) {
+            CFStringRef accessibilityDomain = copySharedResourcesPreferencesDomainForDomain(CFSTR("com.apple.Accessibility"));
+
+            if (accessibilityDomain != NULL) {
+                CFPreferencesSetValue(CFSTR("ApplicationAccessibilityEnabled"), kCFBooleanTrue, accessibilityDomain, kCFPreferencesAnyUser, kCFPreferencesAnyHost);
+                CFRelease(accessibilityDomain);
+            }
+        }
+    }
+
+    // Load the UIAutomation framework.
+    dlopen("/Developer/Library/PrivateFrameworks/UIAutomation.framework/UIAutomation", RTLD_LOCAL);
+
+    SpecLauncher *launcher = [[self alloc] init];
+    [[NSNotificationCenter defaultCenter] addObserver:launcher selector:@selector(appLaunched:) name:UIApplicationDidBecomeActiveNotification object:nil];
+    return launcher;
+}
+
+- (void)appLaunched:(id)notification
+{
+    // unregister observer to avoid duplicate invocation
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:UIApplicationDidBecomeActiveNotification object:nil];
+    // Give a bit of time for the simulator to attach...
+    [self performSelector:@selector(runSpecs) withObject:nil afterDelay:0.3];
+}
+
+- (void)runSpecs
+{
+EOS
+        spec_objs.each do |_, init_func|
+          main_txt << "#{init_func}(self, 0);\n"
+        end
+        main_txt << "[NSClassFromString(@\"Bacon\") performSelector:@selector(run)];\n"
+        main_txt << <<EOS
+}
+
+@end
+EOS
+      end
+      main_txt << <<EOS
+int
+main(int argc, char **argv)
+{
+    NSAutoreleasePool *pool = [[NSAutoreleasePool alloc] init];
+    int retval = 0;
+EOS
+    if ENV['ARR_CYCLES_DISABLE']
+      main_txt << <<EOS
+    setenv("ARR_CYCLES_DISABLE", "1", true);
+EOS
+    end
+    main_txt << "[SpecLauncher launcher];\n" if spec_mode
+    main_txt << <<EOS
+    RubyMotionInit(argc, argv);
+EOS
+    main_txt << <<EOS
+    dlopen("/System/Library/PrivateFrameworks/PlugInKit.framework/PlugInKit", 0x1);
+    objc_msgSend(NSClassFromString(@"PKService"), @selector(_defaultRun:arguments:), argc, argv);
+    rb_exit(0);
+    [pool release];
+    return 0;
+}
+EOS
+    end
+
   end
 end; end

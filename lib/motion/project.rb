@@ -30,6 +30,8 @@ require 'motion/project/builder'
 require 'motion/project/vendor'
 require 'motion/project/template'
 require 'motion/project/plist'
+require 'motion/project/extension'
+require 'motion/project/extension_generator'
 
 if Motion::Project::App.template == nil
   warn "require 'motion/project' is deprecated, please require 'motion/project/template/ios' instead"
@@ -39,6 +41,14 @@ end
 # Check for updates.
 motion_bin_path = File.join(File.dirname(__FILE__), '../../bin/motion')
 system("/usr/bin/ruby \"#{motion_bin_path}\" update --check")
+
+# Require rakefiles for iOS and OSX extensions
+if Dir.exist?(Motion::Project::ExtensionGenerator::ExtensionsPath) && plugin_dirs = Dir.glob("#{Motion::Project::ExtensionGenerator::ExtensionsPath}/*/")
+  plugin_dirs.each do |dir|
+    rakefile_path = File.join(dir + 'Rakefile')
+    import rakefile_path  if File.exist?(rakefile_path)
+  end
+end
 
 desc "Clear local build objects"
 task :clean do
