@@ -4,28 +4,28 @@ At this point it is very fragile and should not be used for anything other than 
 
 To install it:
 
-`rake install`
+  rake install
 
 To uninstallit
 
-`rake uninstall`
+  rake uninstall
 
 
 This is pretty much everything you can do right now:
 
 1- Create a Rubymotion project
 
-`motion create my-app && cd my-app`
+  motion create my-app && cd my-app
 
 2- Create a new Today extension
 
-`motion extension ios-today-extension my-today-extension`
+  motion extension ios-today-extension my-today-extension
 
 3- Compile and run the app in the simulator
 
-`rake`
+  rake
 
-4- Modify `today_extension_controller.rb` to do something else
+4- Modify 'today_extension_controller.rb' to do something else
 
 
 I have added templates for other iOS extension types, but I cannot assure they work. For more information do `motion extension --help`
