@@ -105,6 +105,14 @@ module Motion; module Project;
       Motion::PropertyList.to_s(dict)
     end
 
+    def entitlements_filename
+      "Entitlements.plist"
+    end
+
+    def entitlements_path(platform)
+      File.join(versionized_build_dir(platform), entitlements_filename)
+    end
+
     def common_flags(platform)
       super + " -mmacosx-version-min=#{deployment_target}"
     end

@@ -156,6 +156,14 @@ module Motion; module Project;
       Motion::PropertyList.to_s(dict)
     end
 
+    def entitlements_filename
+      "Entitlements.plist"
+    end
+
+    def entitlements_path(platform)
+      File.join(versionized_build_dir(platform), entitlements_filename)
+    end
+
     def common_flags(platform)
       simulator_version = begin
         flag = " -miphoneos-version-min=#{deployment_target}"
@@ -333,10 +341,6 @@ module Motion; module Project;
 
     def app_resources_dir(platform)
       app_bundle(platform)
-    end
-
-    def app_extensions_dir(platform)
-      File.join(app_bundle(platform), 'PlugIns')
     end
 
     def fonts

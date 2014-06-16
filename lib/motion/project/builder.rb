@@ -146,6 +146,10 @@ module Motion; module Project;
         # Build vendor libraries.
         vendor_libs = build_vendor_libs(extension, platform)
 
+        # Prepare embedded and external frameworks BridgeSupport files (OSX-only).
+        embedded_frameworks = prepare_embedded_frameworks(extension, platform)
+        external_frameworks = prepare_external_frameworks(extension, platform)
+
         # Build object files.
         objs_build_dir = File.join(build_dir, 'objs')
         FileUtils.mkdir_p(objs_build_dir)
@@ -180,7 +184,7 @@ module Motion; module Project;
           or vendor_libs.any? { |lib| File.mtime(lib) > File.mtime(extension_exec) } \
           or File.mtime(librubymotion) > File.mtime(extension_exec)
 
-        extension_exec_created = link_executable(extension_exec, extension_objs, init_o, main_extension_o, embedded_frameworks, external_frameworks, should_link_executable, config, platform)
+        extension_exec_created = link_executable(extension_exec, extension_objs, init_o, main_extension_o, embedded_frameworks, external_frameworks, should_link_executable, extension, platform)
 
         # Create extension Info.plist.
         extension_info_plist = File.join(extension_path, 'Info.plist')
@@ -204,7 +208,8 @@ module Motion; module Project;
         @reserved_app_bundle_files = [
           '_CodeSignature/CodeResources', 'CodeResources', 'embedded.mobileprovision',
           'Info.plist', 'PkgInfo', 'ResourceRules.plist',
-          convert_filesystem_encoding([config.identifier, extension.name].join('.'))
+          convert_filesystem_encoding([config.identifier, extension.name].join('.')),
+          extension.entitlements_filename
         ]
 
         # Copy resources, handle subdirectories.

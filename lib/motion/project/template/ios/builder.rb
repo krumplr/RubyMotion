@@ -57,8 +57,25 @@ module Motion; module Project
       bundle_path = config.app_bundle(platform)
       raise unless File.exist?(bundle_path)
 
+      # Prepare extensions
+      config.extensions.each do |extension|
+        resource_rules_plist = create_resourcerules_file(extension.extension_path(platform))
+        copy_provisioning_profile(extension.extension_path(platform), config)
+        codesign_executable(extension.extension_path(platform), resource_rules_plist, extension, platform)
+      end
+
       # Create bundle/ResourceRules.plist.
-      resource_rules_plist = File.join(bundle_path, 'ResourceRules.plist')
+      resource_rules_plist = create_resourcerules_file(bundle_path)
+
+      # Copy the provisioning profile.
+      copy_provisioning_profile(bundle_path, config)
+
+      # Codesign.
+      codesign_executable(bundle_path, resource_rules_plist, config, platform)
+    end
+
+    def create_resourcerules_file(path)
+      resource_rules_plist = File.join(path, 'ResourceRules.plist')
       unless File.exist?(resource_rules_plist)
         App.info 'Create', resource_rules_plist
         File.open(resource_rules_plist, 'w') do |io|
@@ -91,13 +108,16 @@ module Motion; module Project
 PLIST
         end
       end
+      resource_rules_plist
+    end
 
-      # Copy the provisioning profile.
-      bundle_provision = File.join(bundle_path, "embedded.mobileprovision")
+    def copy_provisioning_profile(path, config)
+      bundle_provision = File.join(path, "embedded.mobileprovision")
       App.info 'Create', bundle_provision
       FileUtils.cp config.provisioning_profile, bundle_provision
+    end
 
-      # Codesign.
+    def codesign_executable(path, resource_rules_plist, config, platform)
       codesign_cmd = "CODESIGN_ALLOCATE=\"#{File.join(config.platform_dir(platform), 'Developer/usr/bin/codesign_allocate')}\" /usr/bin/codesign"
       app_frameworks = File.join(config.app_bundle(platform), 'Frameworks')
       config.embedded_frameworks.each do |framework|
@@ -109,13 +129,14 @@ PLIST
         end
       end
 
-      if File.mtime(config.project_file) > File.mtime(bundle_path) \
-          or !system("#{codesign_cmd} --verify \"#{bundle_path}\" >& /dev/null")
-        App.info 'Codesign', bundle_path
-        entitlements = File.join(config.versionized_build_dir(platform), "Entitlements.plist")
+      if File.mtime(config.project_file) > File.mtime(path) \
+          or !system("#{codesign_cmd} --verify \"#{path}\" >& /dev/null")
+        App.info 'Codesign', path
+        entitlements = config.entitlements_path(platform)
         File.open(entitlements, 'w') { |io| io.write(config.entitlements_data) }
-        sh "#{codesign_cmd} -f -s \"#{config.codesign_certificate}\" --resource-rules=\"#{resource_rules_plist}\" --entitlements #{entitlements} \"#{bundle_path}\""
+        sh "#{codesign_cmd} -f -s \"#{config.codesign_certificate}\" --resource-rules=\"#{resource_rules_plist}\" --entitlements #{entitlements} \"#{path}\""
       end
     end
+
   end
 end; end

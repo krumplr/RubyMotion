@@ -70,8 +70,9 @@ module Motion; module Project;
       config.supported_sdk_versions(versions)
     end
 
-    def common_plist_data(identifier)
+    def common_plist_data(platform, identifier)
       {
+        'BuildMachineOSBuild' => `sw_vers -buildVersion`.strip,
         'CFBundleDevelopmentRegion' => 'en',
         'CFBundleDisplayName' => @name,
         'CFBundleExecutable' => [identifier, @name].join('.'),
@@ -81,7 +82,18 @@ module Motion; module Project;
         'CFBundlePackageType' => 'XPC!',
         'CFBundleShortVersionString' => (@short_version || @version),
         'CFBundleSignature' => @bundle_signature,
-        'CFBundleVersion' => @version
+        'CFBundleVersion' => config.version,
+        'MinimumOSVersion' => config.deployment_target,
+        'CFBundleResourceSpecification' => 'ResourceRules.plist',
+        'CFBundleSupportedPlatforms' => [config.deploy_platform],
+        'UIDeviceFamily' => config.device_family_ints.map { |x| ENV['__USE_DEVICE_INT__'] ? x.to_i : x.to_s },
+        'DTXcodeBuild' => config.xcode_version[1],
+        'DTSDKName' => "#{platform.downcase}#{sdk_version}",
+        'DTSDKBuild' => config.sdk_build_version(platform),
+        'DTPlatformName' => platform.downcase,
+        'DTCompiler' => 'com.apple.compilers.llvm.clang.1_0',
+        'DTPlatformVersion' => config.sdk_version,
+        'DTPlatformBuild' => config.sdk_build_version(platform),
       }
     end
 
@@ -92,7 +104,7 @@ module Motion; module Project;
           'NSExtensionPrincipalClass' => 'TodayViewController',
           'NSExtensionPointIdentifier' => 'com.apple.widget-extension'
         }
-      }.merge(common_plist_data(identifier)))
+      }.merge(common_plist_data(platform, identifier)))
     end
 
     def keyboard_service_plist_data(platform, identifier)
@@ -102,7 +114,7 @@ module Motion; module Project;
           'NSExtensionPrincipalClass' => 'KeyboardViewController',
           'NSExtensionPointIdentifier' => 'com.apple.keyboard-service'
         }
-      }.merge(common_plist_data(identifier)))
+      }.merge(common_plist_data(platform, identifier)))
     end
 
     def share_services_plist_data(platform, identifier)
@@ -112,7 +124,7 @@ module Motion; module Project;
           'NSExtensionPrincipalClass' => 'ShareViewController',
           'NSExtensionPointIdentifier' => 'com.apple.share-services'
         }
-      }.merge(common_plist_data(identifier)))
+      }.merge(common_plist_data(platform, identifier)))
     end
 
     def photo_editing_plist_data(platform, identifier)
@@ -122,7 +134,7 @@ module Motion; module Project;
           'NSExtensionPrincipalClass' => 'PhotoEditingViewController',
           'NSExtensionPointIdentifier' => 'com.apple.photo-editing'
         }
-      }.merge(common_plist_data(identifier)))
+      }.merge(common_plist_data(platform, identifier)))
     end
 
     def fileprovider_nonui_photo_editing_plist_data(platform, identifier)
@@ -132,7 +144,7 @@ module Motion; module Project;
           'NSExtensionPrincipalClass' => 'FileProvider',
           'NSExtensionPointIdentifier' => 'com.apple.fileprovider-nonui'
         }
-      }.merge(common_plist_data(identifier)))
+      }.merge(common_plist_data(platform, identifier)))
     end
 
     def ui_services_plist_data(platform, identifier)
@@ -142,7 +154,37 @@ module Motion; module Project;
           'NSExtensionPrincipalClass' => 'ActionViewController',
           'NSExtensionPointIdentifier' => 'com.apple.ui-services'
         }
-      }.merge(common_plist_data(identifier)))
+      }.merge(common_plist_data(platform, identifier)))
+    end
+
+    def fileprovider_ui_photo_editing_plist_data(platform, identifier)
+      Motion::PropertyList.to_s({
+        'NSExtension' => {
+          'NSExtensionAttributes' => self.attributes,
+          'NSExtensionPrincipalClass' => 'DocumentPickerViewController',
+          'NSExtensionPointIdentifier' => 'com.apple.fileprovider-ui'
+        }
+      }.merge(common_plist_data(platform, identifier)))
+    end
+
+    def entitlements_data
+      dict = entitlements.dup
+      if ['fileprovider-ui', 'fileprovider-nonui'].include? type
+        dict['com.apple.security.application-groups'] = config.identifier
+      end
+      Motion::PropertyList.to_s(dict)
+    end
+
+    def entitlements_filename
+      "#{@name}.entitlements"
+    end
+
+    def entitlements_path(platform)
+      File.join(extension_path(platform), entitlements_filename)
+    end
+
+    def codesign_certificate
+      config.codesign_certificate
     end
 
   end

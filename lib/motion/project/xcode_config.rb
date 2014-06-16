@@ -464,6 +464,9 @@ EOS
       @vendor_projects.each { |vendor| vendor.clean }
     end
 
+    def app_extensions_dir(platform)
+      File.join(app_bundle(platform), 'PlugIns')
+    end
 
     def extension_main_cpp_file_txt(spec_objs)
       main_txt = <<EOS
