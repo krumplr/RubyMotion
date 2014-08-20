@@ -621,6 +621,7 @@ module Motion; module Project;
 
     def prepare_external_frameworks(config, platform)
       if config.respond_to?(:external_frameworks)
+        embedded_frameworks = config.embedded_frameworks
         external_frameworks = config.external_frameworks.map { |x| File.expand_path(x) }
         (embedded_frameworks + external_frameworks).each do |path|
           headers = Dir.glob(File.join(path, 'Headers/**/*.h'))
