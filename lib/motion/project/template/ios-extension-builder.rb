@@ -82,7 +82,9 @@ PLIST
 
       @host_app_dir = ENV['RM_TARGET_HOST_APP_PATH']
       config.sdk_version = ENV['RM_TARGET_SDK_VERSION'] if ENV['RM_TARGET_SDK_VERSION']
-      config.deployment_target = ENV['RM_TARGET_DEPLOYMENT_TARGET'] if ENV['RM_TARGET_DEPLOYMENT_TARGET']
+      unless config.deployment_target
+        config.deployment_target = ENV['RM_TARGET_DEPLOYMENT_TARGET'] if ENV['RM_TARGET_DEPLOYMENT_TARGET']
+      end
       if ENV['RM_TARGET_ARCHS']
         eval(ENV['RM_TARGET_ARCHS']).each do |platform, archs|
           config.archs[platform] = archs.uniq

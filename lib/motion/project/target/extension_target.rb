@@ -83,5 +83,14 @@ module Motion; module Project
     def extension_name
       File.basename(src_extension_path)
     end
+
+    # @return [String] The path to the platform + configuration based directory.
+    #
+    def build_dir
+      File.join(@path, 'build', @platform +
+                         '-8.0' +
+                         '-' + @config.build_mode_name)
+    end
+
   end
 end;end
